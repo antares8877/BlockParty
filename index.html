@@ -28,7 +28,7 @@
   @media (prefers-reduced-motion: reduce){ #wake{transition:none;} }
 </style>
 
-<div id="wake"><p id="wakeMsg">cargando instrumentos…</p></div>
+<div id="wake"><p id="wakeMsg">loading instruments…</p></div>
 <canvas id="stage"></canvas>
 
 <script>
@@ -389,7 +389,7 @@
   var totalAssets = IMG_NAMES.length, started = false;
   function checkReady(){
     if (imagesLoaded >= totalAssets && audioReadyCount >= LAYERS.length){
-      wakeMsg.textContent = 'tocá una tecla para empezar · click para cambiar de vista';
+      wakeMsg.textContent = 'press a key to start · click to switch view';
     }
   }
   var imgCheck = setInterval(function(){
