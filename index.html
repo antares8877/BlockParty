@@ -1,0 +1,745 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style></head><body>
+<title>Block Party</title>
+<style>
+  @font-face{
+    font-family:'MuseoModerno Black';
+    src:url('MuseoModerno-Black.ttf') format('truetype');
+    font-weight:900; font-display:swap;
+  }
+  :root{ --paper:#e8d6bd; --paper-shade:#dcc9a8; --ink:#281847; }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:var(--paper-shade);}
+  body{
+    font-family:-apple-system,'Segoe UI',sans-serif; color:var(--ink);
+    -webkit-font-smoothing:antialiased; touch-action:none; cursor:default;
+    display:flex; align-items:center; justify-content:center;
+    width:100vw; height:100vh;
+  }
+  #stage{display:block;}
+  #wake{
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background:var(--paper-shade); z-index:10; transition:opacity .4s ease;
+  }
+  #wake.gone{opacity:0; pointer-events:none;}
+  #wake p{
+    font-family:ui-monospace,monospace; font-size:clamp(12px,2vw,15px);
+    letter-spacing:.08em; text-transform:uppercase; color:var(--ink); opacity:.6; text-align:center;
+  }
+  @media (prefers-reduced-motion: reduce){ #wake{transition:none;} }
+</style>
+
+<div id="wake"><p id="wakeMsg">cargando instrumentos…</p></div>
+<canvas id="stage"></canvas>
+
+<script>
+(function(){
+  "use strict";
+
+  /* -----------------------------------------------------------------
+     BLOCK PARTY  ·  v3
+     Instrumento visual para componer por capas de ritmo.
+     Canvas2D + Web Audio, sin librerias.
+
+     Musica: 8 capas en loop (mp3), 110 BPM, 4 compases de 4/4.
+       16 tiempos x 60/110 s = 8.727279 s por vuelta
+       (= 384873 muestras a 44.1 kHz, verificado al decodificar).
+     Grilla: 24 x 13 modulos de lado m (se adapta a la ventana).
+     Teclas: Q S X F W D C A prenden/apagan capas,
+             espacio = silencio total, flechas = volumen general,
+             click = alterna botonera / vista pasiva.
+
+     v2: reloj comun (las capas entran en el proximo tiempo y siempre
+     en fase), loop sin clic, fades, mezcla recalibrada por loudness,
+     shakers a tempo.
+     v3: trumpet y bamboos afinados a la tonalidad (Sol mayor),
+     el bajo se aparta en cada golpe del bombo (ducking con el reloj),
+     paneo estereo, reverb compartida, indicador de 16 tiempos.
+     Detalle y backlog en BLOCK_PARTY.md.
+  -------------------------------------------------------------------*/
+
+  var TAU = Math.PI * 2;
+
+  // las 8 capas.
+  //   mixVol  = volumen en la mezcla, calibrado midiendo loudness (LUFS)
+  //             de cada stem: bajo y bateria al frente (-25.5 LUFS),
+  //             chords/trumpet -29.5, cuerdas -30.5, bamboos -31.5,
+  //             shakers y clap -33. Antes el clap quedaba a -42 (casi
+  //             inaudible) y el bajo tapaba todo a -22.6.
+  //   (v3: niveles re-medidos con paneo, reverb y ducking)
+  //   vizGain = escala de la animacion (los valores de v1), asi los
+  //             visuales se mueven igual aunque cambie la mezcla.
+  //   pan     = posicion estereo (-1 izquierda .. +1 derecha)
+  //   send    = cuanto va a la reverb compartida
+  var LAYERS = [
+    { key:'q', name:'Cuerdas', asset:'cuerdas', mixVol:1.14, vizGain:1,   pan:-0.18, send:0.15 },
+    { key:'s', name:'Shakers', asset:'shakers', mixVol:0.73, vizGain:0.5, pan: 0,    send:0    },
+    { key:'x', name:'Bajo',    asset:'bajo',    mixVol:0.72, vizGain:1,   pan: 0,    send:0    },
+    { key:'f', name:'Bateria', asset:'bateria', mixVol:0.87, vizGain:0.7, pan: 0,    send:0    },
+    { key:'w', name:'Chords',  asset:'chords',  mixVol:0.66, vizGain:0.7, pan: 0.10, send:0.09 },
+    { key:'d', name:'Bamboos', asset:'bamboos', mixVol:0.70, vizGain:0.5, pan:-0.35, send:0.33 },
+    { key:'c', name:'Trumpet', asset:'trumpet', mixVol:1.18, vizGain:1,   pan: 0.30, send:0.30 },
+    { key:'a', name:'Clap',    asset:'clap',    mixVol:1.45, vizGain:0.5, pan: 0,    send:0.24 }
+  ];
+  var byKey = {}, byName = {};
+  LAYERS.forEach(function(L){
+    L.playing=false; L.level=0; L.buffer=null; L.source=null;
+    L.gainNode=null; L.analyser=null; L.rmsBuf=null;
+    byKey[L.key]=L; byName[L.name]=L;
+  });
+
+  /* ---------------- canvas / grid ---------------- */
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var m, miti, DPR, stageW, stageH;
+  function resize(){
+    DPR = Math.min(window.devicePixelRatio||1, 2);
+    m = Math.min(window.innerWidth/24, window.innerHeight/13);
+    miti = m/2;
+    stageW = m*24; stageH = m*13;
+    canvas.width = stageW*DPR; canvas.height = stageH*DPR;
+    canvas.style.width = stageW+'px'; canvas.style.height = stageH+'px';
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  function px(u){ return u*m; }
+
+  // paleta Block Party. SAGE se usa como fondo del bloque de shakers
+  // para que los puntitos negros se lean sobre algo distinto del crema.
+  var PAPER='#e8d6bd', INK='#281847', BLUE='#3337f6', LAVENDER='#fb89ce', ORANGE='#fd5a0f', SAGE='#adc2c7';
+
+  /* ---------------- assets (imagenes) ---------------- */
+  var IMG = {};
+  var IMG_NAMES = ['flor','gradient','cruz','info',
+    'arrowUpWhite','arrowDownWhite','arrowUpBlack','arrowDownBlack',
+    'spacebarWhite','spacebarBlack'];
+  var imagesLoaded = 0;
+  IMG_NAMES.forEach(function(n){
+    var im = new Image();
+    im.onload = function(){ imagesLoaded++; };
+    im.src = n + '.png';
+    IMG[n] = im;
+  });
+
+  function drawImgCenter(img, cx, cy, w, h){
+    if (img && img.complete) ctx.drawImage(img, cx-w/2, cy-h/2, w, h);
+  }
+  function drawImgCorner(img, x, y, w, h){
+    if (img && img.complete) ctx.drawImage(img, x, y, w, h);
+  }
+
+  /* ---------------- motor de audio (v2) ----------------
+     Cadena por capa:
+       voz (BufferSource + envolvente propia) -> L.bus -> L.analyser
+         -> L.gainNode (mezcla) -> master (volgeneral) -> salida
+     El analyser va ANTES de la mezcla: la animacion no cambia si
+     se recalibra la mezcla (rms() la escala con vizGain).
+
+     RELOJ COMUN: t0 = instante del tiempo 1 del compas 1. Toda capa
+     entra en el proximo punto de la grilla (QUANT) y arranca en la
+     posicion del loop que corresponde a ese instante -> siempre en
+     fase. Si no suena nada, el reloj se reinicia y la capa arranca
+     ya, desde el principio del loop. */
+  var SR_FILES   = 44100;
+  var LOOP_44K   = 384873;   // muestras exactas del loop (4 compases a 110 BPM)
+  var MP3_EXTRA  = 2199;     // relleno total del encoder (576 + 1623)
+  var MP3_HEAD   = 1105;     // parte del relleno que va al principio (576 + 529)
+  var QUANT      = 'beat';   // 'beat' | 'bar' | 'sixteenth' — donde entran las capas
+  var SEAM_MS    = 3;        // largo del empalme suave al final del loop
+  var FADE_IN    = 0.004;    // s
+  var FADE_OUT   = 0.015;    // constante de tiempo del fade de salida (s)
+  var LOOKAHEAD  = 0.03;     // margen para no programar en el pasado (s)
+
+  var actx = new (window.AudioContext||window.webkitAudioContext)();
+  var volgeneral = 1;
+  var audioReadyCount = 0;
+  var LOOP = LOOP_44K / SR_FILES;   // se reemplaza por el largo real del buffer
+  var t0 = null;                    // reloj comun
+
+  var master = actx.createGain();
+  master.gain.value = volgeneral;
+  master.connect(actx.destination);
+
+  // reverb compartida: una sala corta (1.6 s) generada en el momento.
+  // El envio pasa por un pasa-altos para que la reverb no ensucie los graves.
+  var reverbIn = actx.createGain();
+  var reverbHP = actx.createBiquadFilter();
+  reverbHP.type = 'highpass'; reverbHP.frequency.value = 280;
+  var reverb = actx.createConvolver();
+  reverb.normalize = false;              // el impulso ya viene con energia 1
+  reverb.buffer = makeImpulse(1.6, 2.6, 0.012);
+  reverbIn.connect(reverbHP); reverbHP.connect(reverb); reverb.connect(master);
+  function makeImpulse(sec, decay, predelay){
+    var sr = actx.sampleRate, len = Math.round(sec*sr), pre = Math.round(predelay*sr);
+    var b = actx.createBuffer(2, len, sr);
+    for (var c=0;c<2;c++){
+      var d = b.getChannelData(c), rnd = seeded(101 + c*7919), i;
+      for (i=pre;i<len;i++){
+        var t = (i-pre)/(len-pre);
+        d[i] = (rnd()*2-1) * Math.pow(1-t, decay);
+      }
+      var e = 0; for (i=0;i<len;i++) e += d[i]*d[i];
+      var k = 1/Math.sqrt(e); for (i=0;i<len;i++) d[i] *= k;
+    }
+    return b;
+  }
+
+  // DUCKING: el bombo cae en los 16 tiempos; el bajo baja DUCK_DB
+  // justo en cada golpe y vuelve en ~100 ms. Programado con el reloj
+  // comun (no es un compresor: no "escucha", sabe cuando viene el golpe).
+  var DUCK_DB = -5, DUCK_HOLD = 0.04, DUCK_REL = 0.025;
+  var duckBeat = -1;
+  function layerOnAt(L, t){
+    if (!L.voice) return false;
+    if (L.pending === 'on'  && t < L.pendingAt) return false;
+    if (L.pending === 'off' && t >= L.pendingAt) return false;
+    return true;
+  }
+  function scheduleDuck(){
+    var B = byName.Bajo, D = byName.Bateria;
+    if (!B.duck || t0 === null) return;
+    var now = actx.currentTime, beat = LOOP/16;
+    var k0 = Math.max(duckBeat+1, Math.ceil((now + 0.01 - t0)/beat));
+    var k1 = Math.floor((now + 0.2 - t0)/beat);
+    var depth = Math.pow(10, DUCK_DB/20);
+    for (var k=k0; k<=k1; k++){
+      var t = t0 + k*beat;
+      if (layerOnAt(B, t) && layerOnAt(D, t)){
+        B.duck.gain.setTargetAtTime(depth, t - 0.004, 0.003);
+        B.duck.gain.setTargetAtTime(1, t + DUCK_HOLD, DUCK_REL);
+      }
+      duckBeat = k;
+    }
+  }
+  setInterval(scheduleDuck, 40);
+
+  function gridStep(){
+    return QUANT==='bar' ? LOOP/4 : QUANT==='sixteenth' ? LOOP/64 : LOOP/16;
+  }
+
+  /* recorta el relleno del mp3 (si el navegador no lo hizo) y suaviza
+     el empalme fin->principio para que el loop no haga clic */
+  function prepareBuffer(buf){
+    var sr = buf.sampleRate, ratio = sr/SR_FILES;
+    var len = Math.round(LOOP_44K*ratio);
+    var extra = buf.length - len;
+    var head = extra > 0 ? Math.round(extra*MP3_HEAD/MP3_EXTRA) : 0;
+    var out = actx.createBuffer(buf.numberOfChannels, len, sr);
+    var n = Math.max(2, Math.round(SEAM_MS/1000*sr));
+    for (var c=0;c<buf.numberOfChannels;c++){
+      var src = buf.getChannelData(c), d = out.getChannelData(c);
+      d.set(src.subarray(head, Math.min(src.length, head+len)));
+      seamFix(d, n);
+    }
+    return out;
+  }
+  function seamFix(d, n){
+    var L = d.length;
+    var target = d[0];                   // el final llega al valor del principio
+    var jump = target - d[L-1];
+    for (var k=0;k<n;k++){
+      var w = (k+1)/n; w = 0.5 - 0.5*Math.cos(Math.PI*w);
+      d[L-n+k] += jump*w;
+    }
+  }
+
+  LAYERS.forEach(function(L){
+    L.bus = actx.createGain();
+    L.analyser = actx.createAnalyser();
+    L.analyser.fftSize = 1024;
+    L.rmsBuf = new Float32Array(L.analyser.fftSize);
+    L.gainNode = actx.createGain();
+    L.gainNode.gain.value = L.mixVol;
+    L.bus.connect(L.analyser);
+    L.analyser.connect(L.gainNode);
+    var out = L.gainNode;
+    if (L.name === 'Bajo'){ L.duck = actx.createGain(); out.connect(L.duck); out = L.duck; }
+    if (actx.createStereoPanner && L.pan){
+      L.panner = actx.createStereoPanner(); L.panner.pan.value = L.pan;
+      out.connect(L.panner); out = L.panner;
+    }
+    out.connect(master);
+    if (L.send > 0){
+      L.sendGain = actx.createGain(); L.sendGain.gain.value = L.send;
+      out.connect(L.sendGain); L.sendGain.connect(reverbIn);
+    }
+    L.voice = null; L.pending = null; L.pendingAt = 0;
+
+    fetch(L.asset + '.mp3')
+      .then(function(r){ return r.arrayBuffer(); })
+      .then(function(ab){ return actx.decodeAudioData(ab); })
+      .then(function(buf){
+        L.buffer = prepareBuffer(buf);
+        LOOP = L.buffer.length / L.buffer.sampleRate;
+        audioReadyCount++; checkReady();
+      })
+      .catch(function(e){ audioReadyCount++; checkReady(); console.warn('audio load failed', L.asset, e); });
+  });
+
+  function updateVolumes(){
+    master.gain.setTargetAtTime(volgeneral, actx.currentTime, 0.03);
+  }
+
+  function resumeAudio(){ if (actx.state === 'suspended') actx.resume(); }
+
+  function anyActive(){
+    return LAYERS.some(function(L){ return L.voice || L.pending; });
+  }
+  // proximo punto de grilla del reloj comun
+  function nextSlot(){
+    var now = actx.currentTime;
+    if (t0 === null || !anyActive()){ t0 = now + 0.06; duckBeat = -1; return t0; }
+    var q = gridStep();
+    var k = Math.ceil((now + LOOKAHEAD - t0)/q);
+    return t0 + k*q;
+  }
+  function loopOffset(when){
+    var o = (when - t0) % LOOP;
+    return o < 0 ? o + LOOP : o;
+  }
+
+  function startVoice(L, when){
+    var src = actx.createBufferSource();
+    src.buffer = L.buffer; src.loop = true;
+    var env = actx.createGain();
+    env.gain.setValueAtTime(0, actx.currentTime);
+    env.gain.setValueAtTime(0, when);
+    env.gain.linearRampToValueAtTime(1, when + FADE_IN);
+    src.connect(env); env.connect(L.bus);
+    src.start(when, loopOffset(when));
+    return { src:src, env:env, timer:null };
+  }
+  function releaseVoice(v, when){
+    var stopIn = Math.max(0, when - actx.currentTime) + FADE_OUT*8;
+    v.env.gain.cancelScheduledValues(when);
+    v.env.gain.setTargetAtTime(0, when, FADE_OUT);
+    v.timer = setTimeout(function(){
+      try{ v.src.stop(); }catch(e){}
+      v.src.disconnect(); v.env.disconnect();
+    }, stopIn*1000 + 50);
+  }
+  function cancelRelease(v){
+    clearTimeout(v.timer); v.timer = null;
+    var now = actx.currentTime;
+    v.env.gain.cancelScheduledValues(now);
+    v.env.gain.setTargetAtTime(1, now, 0.005);
+  }
+
+  function toggleLayer(L){
+    if (!L.buffer) return;
+    if (L.pending === 'on'){                 // arrepentimiento antes de entrar
+      releaseVoice(L.voice, actx.currentTime); L.voice = null; L.pending = null; return;
+    }
+    if (L.pending === 'off'){                // arrepentimiento antes de salir
+      cancelRelease(L.voice); L.pending = null; L.playing = true; return;
+    }
+    var when = nextSlot();
+    if (L.voice){                            // apagar en el proximo tiempo
+      releaseVoice(L.voice, when);
+      L.pending = 'off'; L.pendingAt = when;
+    } else {                                 // prender en el proximo tiempo
+      L.voice = startVoice(L, when);
+      L.pending = 'on'; L.pendingAt = when;
+    }
+  }
+  // espacio: silencio total, ya (sin esperar la grilla)
+  function stopAll(){
+    var now = actx.currentTime;
+    LAYERS.forEach(function(L){
+      if (L.voice){ clearTimeout(L.voice.timer); releaseVoice(L.voice, now); }
+      L.voice = null; L.pending = null; L.playing = false;
+    });
+  }
+  // cada frame: confirma los cambios cuando llega su momento
+  function tickStates(){
+    var now = actx.currentTime;
+    LAYERS.forEach(function(L){
+      if (L.pending && now >= L.pendingAt){
+        if (L.pending === 'on'){ L.playing = true; }
+        else { L.playing = false; L.voice = null; }
+        L.pending = null;
+      }
+    });
+  }
+
+  function rms(L){
+    if (!L.playing) return 0;
+    L.analyser.getFloatTimeDomainData(L.rmsBuf);
+    var sum=0;
+    for (var i=0;i<L.rmsBuf.length;i++){ var v=L.rmsBuf[i]; sum += v*v; }
+    return Math.sqrt(sum/L.rmsBuf.length) * L.vizGain * volgeneral;
+  }
+
+  // posicion musical actual (para sincronizar visuales con el tempo)
+  function sixteenthIndex(){
+    if (t0 === null) return -1;
+    return Math.floor((actx.currentTime - t0) / (LOOP/64));
+  }
+  function seeded(seed){            // mulberry32: azar repetible por paso
+    return function(){
+      seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+      var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  /* ---------------- ready / wake ---------------- */
+  var wakeEl = document.getElementById('wake'), wakeMsg = document.getElementById('wakeMsg');
+  var totalAssets = IMG_NAMES.length, started = false;
+  function checkReady(){
+    if (imagesLoaded >= totalAssets && audioReadyCount >= LAYERS.length){
+      wakeMsg.textContent = 'tocá una tecla para empezar · click para cambiar de vista';
+    }
+  }
+  var imgCheck = setInterval(function(){
+    if (imagesLoaded >= totalAssets){ checkReady(); clearInterval(imgCheck); }
+  }, 150);
+
+  /* ---------------- input ---------------- */
+  var pressed = {};
+  var prendido = true;
+  var heldUp=false, heldDown=false, heldSpace=false;
+  function wake(){ if(!started){ started=true; wakeEl.classList.add('gone'); } }
+
+  window.addEventListener('keydown', function(e){
+    var k = e.key.toLowerCase();
+    if (k===' '){ e.preventDefault(); heldSpace=true; wake(); resumeAudio(); stopAll(); return; }
+    if (k==='arrowup'){ e.preventDefault(); heldUp=true; volgeneral=Math.min(1,volgeneral+0.1); updateVolumes(); return; }
+    if (k==='arrowdown'){ e.preventDefault(); heldDown=true; volgeneral=Math.max(0,volgeneral-0.1); updateVolumes(); return; }
+    var L = byKey[k];
+    if (!L) return;
+    e.preventDefault();
+    if (pressed[k]) return;
+    pressed[k]=true;
+    wake(); resumeAudio();
+    toggleLayer(L);
+  });
+  window.addEventListener('keyup', function(e){
+    var k=e.key.toLowerCase();
+    pressed[k]=false;
+    if (k===' ') heldSpace=false;
+    if (k==='arrowup') heldUp=false;
+    if (k==='arrowdown') heldDown=false;
+  });
+  canvas.addEventListener('click', function(){ prendido = !prendido; });
+
+  /* ---------------- botones ----------------
+     apagado = fondo ink + borde paper + letra paper;
+     prendido = fondo paper + borde paper + letra ink.
+     Tipografia MuseoModerno-Black, tamano m/1.7. */
+  function roundRectPath(x,y,w,h,rad){
+    ctx.beginPath();
+    ctx.moveTo(x+rad,y); ctx.arcTo(x+w,y,x+w,y+h,rad); ctx.arcTo(x+w,y+h,x,y+h,rad);
+    ctx.arcTo(x,y+h,x,y,rad); ctx.arcTo(x,y,x+w,y,rad); ctx.closePath();
+  }
+  function botonBase(gx, gy, fill){
+    var x=px(gx), y=px(gy);
+    ctx.fillStyle = fill;
+    roundRectPath(x, y, m, m, m/3); ctx.fill();
+    ctx.strokeStyle = PAPER; ctx.lineWidth = 2;
+    roundRectPath(x, y, m, m, m/3); ctx.stroke();
+  }
+  function botonApagado(gx, gy, letra){
+    botonBase(gx, gy, INK);
+    if (letra){
+      ctx.fillStyle = PAPER;
+      ctx.font = '900 ' + (m/1.7) + 'px "MuseoModerno Black",sans-serif';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(letra, px(gx)+m/2, px(gy)+m/2+1);
+      ctx.textAlign='left';
+    }
+  }
+  function botonPrendido(gx, gy, letra){
+    botonBase(gx, gy, PAPER);
+    if (letra){
+      ctx.fillStyle = INK;
+      ctx.font = '900 ' + (m/1.7) + 'px "MuseoModerno Black",sans-serif';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(letra, px(gx)+m/2, px(gy)+m/2+1);
+      ctx.textAlign='left';
+    }
+  }
+  function boton(gx, gy, L){
+    if (L.pending){                       // esperando el proximo tiempo
+      botonBase(gx, gy, ORANGE);
+      ctx.fillStyle = PAPER;
+      ctx.font = '900 ' + (m/1.7) + 'px "MuseoModerno Black",sans-serif';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(L.key, px(gx)+m/2, px(gy)+m/2+1);
+      ctx.textAlign='left';
+      return;
+    }
+    (L.playing?botonPrendido:botonApagado)(gx, gy, L.key);
+  }
+
+  /* ---------------- bajo (incondicional, primero) ----------------
+     rect(7,1,11,3) azul; xbajo = 7m + nivel*11m; 10 lineas
+     desde el punto fijo (7,4) a (xbajo+i, 1) — el abanico se desliza. */
+  function drawBajoBase(){
+    var L = byName.Bajo;
+    ctx.fillStyle = BLUE; ctx.fillRect(px(7), px(1), px(11), px(3));
+    var level = rms(L);
+    var xbajo = px(7) + level*px(11);
+    ctx.strokeStyle = PAPER; ctx.lineWidth = 2;
+    for (var i=0;i<10;i++){
+      ctx.beginPath();
+      ctx.moveTo(px(7), px(4));
+      ctx.lineTo(xbajo + i*m, px(1));
+      ctx.stroke();
+    }
+  }
+
+  /* ---------------- botonera / vista pasiva ---------------- */
+  function botonera(){
+    ctx.fillStyle = INK; roundRectPath(px(5),px(4),px(7),px(7),0); ctx.fill();
+
+    // flechitas de volumen — botón base + ícono blanco, y si está
+    // apretada: botón prendido + ícono negro encima.
+    botonApagado(6,9,''); drawImgCenter(IMG.arrowUpWhite, px(6)+m*0.48, px(9)+m*0.7, m*0.4, m*0.9);
+    botonApagado(7,9,''); drawImgCenter(IMG.arrowDownWhite, px(7)+m*0.5, px(9)+m*0.28, m*0.4, m*0.9);
+    if (heldUp){ botonPrendido(6,9,''); drawImgCenter(IMG.arrowUpBlack, px(6)+m*0.5, px(9)+m*0.75, m*0.5, m); }
+    if (heldDown){ botonPrendido(7,9,''); drawImgCenter(IMG.arrowDownBlack, px(7)+m*0.5, px(9)+m*0.3, m*0.5, m); }
+
+    // spacebar — fondo ink + borde paper + ícono; si está apretada,
+    // fondo paper + ícono negro.
+    ctx.fillStyle = INK; ctx.strokeStyle = PAPER; ctx.lineWidth = 2;
+    roundRectPath(px(8), px(8), m*3, m, m/3); ctx.fill(); ctx.stroke();
+    drawImgCenter(IMG.spacebarWhite, px(9.5), px(8.5), m*2.5, m*0.625);
+    if (heldSpace){
+      ctx.fillStyle = PAPER;
+      roundRectPath(px(8), px(8), m*3, m, m/3); ctx.fill(); ctx.stroke();
+      drawImgCenter(IMG.spacebarBlack, px(9.5), px(8.5), m*2.5, m*0.625);
+    }
+
+    boton(7,7, byName.Bajo);
+    boton(8,6, byName.Bamboos);
+    boton(9,6, byName.Bateria);
+    boton(7,5, byName.Chords);
+    boton(6,6, byName.Clap);
+    boton(6,5, byName.Cuerdas);
+    boton(7,6, byName.Shakers);
+    boton(8,7, byName.Trumpet);
+
+    drawImgCenter(IMG.cruz, px(11.5), px(4.5), m/3, m/3);
+  }
+
+  // vista pasiva — orden de dibujo: clap, chords, bateria, trumpet,
+  // shakers, bamboos, bajo, cuerdas, luego el ícono info.
+  function vistaPasiva(){
+    ctx.fillStyle = INK; ctx.fillRect(px(5), px(4), px(7), px(7));
+
+    if (byName.Clap.playing){
+      ctx.fillStyle = LAVENDER; ctx.fillRect(px(8), px(8), px(4), px(3));
+      ctx.fillStyle = BLUE;
+      ctx.fillRect(px(5), px(8), px(3), px(3));
+      ctx.fillRect(px(10), px(8), px(1), px(3));
+    }
+    if (byName.Chords.playing){
+      ctx.save();
+      ctx.translate(px(10), px(6)); ctx.rotate(Math.PI);
+      drawImgCenter(IMG.gradient, 0, 0, px(4), px(4));
+      ctx.restore();
+    }
+    if (byName.Bateria.playing){
+      ctx.fillStyle = BLUE; ctx.fillRect(px(5), px(4), px(3), px(7));
+      [11,9.5,8,6.5,5].forEach(function(y){
+        ctx.save(); ctx.translate(px(6.5), px(y)); ctx.rotate(Math.PI/4);
+        ctx.fillStyle = INK; var s=m*2.12; ctx.fillRect(-s/2,-s/2,s,s);
+        ctx.restore();
+      });
+    }
+    if (byName.Trumpet.playing){
+      ctx.fillStyle = ORANGE; ctx.fillRect(px(5), px(4), px(3), px(4));
+      ctx.fillStyle = LAVENDER;
+      roundRectPath(px(0), px(4), px(8), px(4), m*2); ctx.fill();
+    }
+    if (byName.Shakers.playing){
+      ctx.fillStyle = BLUE;
+      for (var gx=8; gx<12; gx+=0.5){
+        for (var gy=4; gy<8; gy+=0.5){
+          ctx.beginPath(); ctx.arc(px(gx), px(gy), m/4, 0, TAU); ctx.fill();
+        }
+      }
+    }
+    if (byName.Bamboos.playing){
+      ctx.fillStyle = ORANGE;
+      [[10,7,1,0.5],[11,8,1,0.5],[8,8,1,0.5],[10,8,2,0.5],
+       [9,8.5,2,0.5],[6,9.5,3,0.5],[7,10,3,0.5],[9,10.5,3,0.5]
+      ].forEach(function(r){ ctx.fillRect(px(r[0]),px(r[1]),px(r[2]),px(r[3])); });
+    }
+    if (byName.Bajo.playing){
+      ctx.strokeStyle = PAPER; ctx.lineWidth = 2;
+      [5,5.5,6,6.5,7].forEach(function(y){
+        ctx.beginPath(); ctx.moveTo(px(5), px(y)); ctx.lineTo(px(12), px(y)); ctx.stroke();
+      });
+    }
+    if (byName.Cuerdas.playing){
+      drawImgCenter(IMG.flor, px(5), px(6), px(2), px(2));
+    }
+    drawImgCenter(IMG.info, px(11.5), px(4.5), m/3, m/3);
+  }
+
+  /* ---------------- DISEÑO ESTÁTICO (incondicional) ---------------- */
+  function disenoEstatico(){
+    ctx.fillStyle = BLUE; ctx.fillRect(px(18), px(4), px(6), px(9));
+    ctx.fillStyle = INK;
+    var x, y;
+    for (x=18; x<22.5; x+=2){ for (y=4.5; y<23; y+=1){ if (y<13) ctx.fillRect(px(x),px(y),m,miti); } }
+    for (x=19; x<24; x+=2){ for (y=4; y<22.5; y+=1){ if (y<13) ctx.fillRect(px(x),px(y),m,miti); } }
+
+    ctx.fillStyle = INK; ctx.fillRect(px(18), px(1), px(3), px(3));
+    ctx.fillStyle = LAVENDER; ctx.fillRect(px(21), px(1), px(3), px(3));
+    ctx.fillStyle = BLUE; ctx.fillRect(px(5), px(11), px(7), px(2));
+
+    ctx.fillStyle = LAVENDER; ctx.fillRect(px(0), px(1), px(5), stageH);
+    ctx.strokeStyle = INK; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(px(2.5), px(1)); ctx.lineTo(px(2.5), px(13)); ctx.stroke();
+
+    ctx.fillStyle = SAGE; ctx.fillRect(px(5), px(1), px(2), px(3));
+  }
+
+  /* ---------------- ANIMACIÓN (incondicional) ---------------- */
+  var BAMBOO_BARS = [
+    {x:18, cant:200, color:ORANGE}, {x:19, cant:270, color:LAVENDER},
+    {x:20, cant:180, color:ORANGE}, {x:21, cant:240, color:LAVENDER},
+    {x:22, cant:310, color:ORANGE}, {x:23, cant:150, color:LAVENDER}
+  ];
+
+  function animacion(){
+    // bamboos — 6 barras; alto = nivel * cant * m
+    var lvlBam = rms(byName.Bamboos);
+    BAMBOO_BARS.forEach(function(b){
+      var h = lvlBam * b.cant * m;
+      ctx.fillStyle = b.color;
+      ctx.fillRect(px(b.x), px(13)-h, m, h);
+    });
+
+    // bateria — rombo; lado = nivel*16.5m sonando, 2.12m en reposo
+    (function(){
+      var L = byName.Bateria;
+      var side = L.playing ? rms(L)*16.5*m : 2.12*m;
+      ctx.save(); ctx.translate(px(19.5), px(2.5)); ctx.rotate(Math.PI/4);
+      ctx.fillStyle = LAVENDER;
+      ctx.fillRect(-side/2,-side/2,side,side);
+      ctx.restore();
+    })();
+
+    // chords — gradient (sin rotar) solo mientras suena, sobre su
+    // cuadrado; flor central, gira solo mientras suena.
+    (function(){
+      var L = byName.Chords;
+      if (L.playing){
+        drawImgCorner(IMG.gradient, px(21), px(1), px(3), px(3));
+        if (!reduceMotion) L.angle = (L.angle||0) + 0.03;
+      } else {
+        L.angle = 0;
+      }
+      ctx.save();
+      ctx.translate(px(22.5), px(2.5)); ctx.rotate(L.angle||0);
+      drawImgCenter(IMG.flor, 0, 0, px(3), px(3));
+      ctx.restore();
+    })();
+
+    // clap — dos barras que se cierran; ancho = nivel*500m
+    (function(){
+      var w = rms(byName.Clap) * 500 * m;
+      ctx.fillStyle = ORANGE;
+      ctx.fillRect(px(5), px(11), w, px(3));
+      ctx.fillRect(px(12)-w, px(11), w, px(3));
+    })();
+
+    // cuerdas — la flor baja; y = 2.5m + nivel*200m
+    (function(){
+      var y = px(2.5) + rms(byName.Cuerdas)*200*m;
+      drawImgCenter(IMG.flor, px(2.5), y, px(3), px(3));
+    })();
+
+    // shakers — puntos al azar, nuevos en cada semicorchea; grilla fija en reposo
+    (function(){
+      var L = byName.Shakers;
+      ctx.fillStyle = '#000';
+      if (L.playing){
+        var n = Math.min(500, Math.round(4*m));
+        var rnd = seeded(sixteenthIndex() + 1);   // nuevo dibujo cada semicorchea
+        for (var i=0;i<n;i++){
+          var rx = px(5) + rnd()*px(2);
+          var ry = px(1) + rnd()*px(3);
+          ctx.beginPath(); ctx.arc(rx, ry, m/80, 0, TAU); ctx.fill();
+        }
+      } else {
+        for (var gx=5.07; gx<6.95; gx+=0.35){
+          for (var gy=1.07; gy<3.95; gy+=0.35){
+            ctx.beginPath(); ctx.arc(px(gx), px(gy), m/80, 0, TAU); ctx.fill();
+          }
+        }
+      }
+    })();
+
+    // trumpet — 3 elipses apiladas en una caja de 9m (centro x=15);
+    // la primera crece con el nivel (4m + nivel*100m), el resto 2:1.
+    (function(){
+      var L = byName.Trumpet;
+      var hcaja = 9*m;
+      var htrumpet = 4*m + rms(L)*100*m;
+      if (htrumpet > hcaja) htrumpet = hcaja;
+      var hresto = hcaja - htrumpet;
+      var h2 = hresto*2/3, h3 = hresto - h2;
+      var cx = px(15), top = px(4);
+      ctx.fillStyle = LAVENDER;
+      ctx.beginPath(); ctx.ellipse(cx, top+htrumpet/2, px(3), htrumpet/2, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx, top+htrumpet+h2/2, px(3), h2/2, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx, top+htrumpet+h2+h3/2, px(3), h3/2, 0, 0, TAU); ctx.fill();
+    })();
+  }
+
+  /* ---------------- indicador de tiempo ----------------
+     16 puntos en la franja superior izquierda (0..4.9, 0..1):
+     4 grupos = 4 compases. El tiempo actual se llena en ink; el
+     tiempo 1 de cada compas es un poco mas grande. Sin sonido: quietos. */
+  function drawBeatIndicator(){
+    var playing = t0 !== null && LAYERS.some(function(L){ return L.playing; });
+    var cur = playing ? Math.floor((actx.currentTime - t0)/(LOOP/16)) : -1;
+    var pos = cur >= 0 ? cur % 16 : -1;
+    for (var k=0;k<16;k++){
+      var bar = Math.floor(k/4), b = k%4;
+      var cx = px(0.45 + bar*1.13 + b*0.26), cy = px(0.5);
+      var r = m*(b===0 ? 0.095 : 0.07);
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU);
+      if (k === pos){ ctx.fillStyle = INK; ctx.fill(); }
+      else { ctx.strokeStyle = INK; ctx.lineWidth = 1.2; ctx.globalAlpha = 0.45; ctx.stroke(); ctx.globalAlpha = 1; }
+    }
+  }
+
+  /* ---------------- barra de volumen ----------------
+     franja naranja arriba; ancho = volgeneral * 24m. */
+  function drawVolumeBar(){
+    var wvolg = volgeneral * px(24);
+    ctx.fillStyle = ORANGE;
+    ctx.fillRect(px(4.9), 0, Math.min(wvolg, stageW-px(4.9)), m);
+  }
+
+  /* ---------------- render loop ---------------- */
+  var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function frame(){
+    draw();
+    requestAnimationFrame(frame);
+  }
+  function draw(){
+    tickStates();
+    ctx.clearRect(0,0,stageW,stageH);
+    ctx.fillStyle = PAPER; ctx.fillRect(0,0,stageW,stageH);
+
+    drawBajoBase();
+    if (prendido) botonera(); else vistaPasiva();
+    disenoEstatico();
+    animacion();
+    drawVolumeBar();
+    drawBeatIndicator();
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+
+</body></html>
